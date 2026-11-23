@@ -9,6 +9,8 @@ import sys
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 
+from aws_cleanup import pick, prompt
+
 ORDER = ("iam-user", "instance-profile", "iam-role", "iam-policy", "s3-bucket", "hosted-zone")
 
 
@@ -205,11 +207,13 @@ def run(session, prefix, types, execute, confirm_account):
         return result
     if not sys.stdin.isatty():
         raise ValueError("Deletion requires an interactive terminal.")
+    found = pick(found, lambda x: f"{x['type']}: {x.get('name', x['id'])}")
+    if not found:
+        return result
+    print(f"\nSelected {len(found)} resources:", file=sys.stderr)
     for entry in found:
         print(f"  {entry['type']}: {entry.get('name', entry['id'])}", file=sys.stderr)
-    print(f"Delete these {len(found)} resources? Type 'delete {prefix}' to continue: ",
-          end="", file=sys.stderr, flush=True)
-    if sys.stdin.readline().strip() != f"delete {prefix}":
+    if prompt(f"Type 'delete {prefix}' to continue: ") != f"delete {prefix}":
         raise ValueError("Deletion not confirmed.")
     for entry in found:
         label = f"{entry['type']}:{entry['id']}"

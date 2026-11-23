@@ -84,44 +84,51 @@ missing or incorrect confirmation aborts the command; any earlier deletion
 requests are not undone. Other selected resources do not receive this additional
 prompt.
 
-### Deleting a group
+### Deleting many resources at once
 
-Use `jq` to select candidates from a recent report, then review the resulting
-list before deleting. For example, to select only unassociated Elastic IPs:
+You don't need to copy selections one by one. There are three bulk modes; use one per run. Each mode starts with a
+fresh scan and lists the chosen resources. Most types are confirmed together: you type `delete N` once, where `N`
+is the count. **IAM users, EFS file systems, key pairs, and security groups** are always confirmed one at a time,
+with `y`, `n` (default), or `q` to skip the rest. Bulk modes require an interactive terminal and
+`--confirm-account`.
 
-```bash
-jq -r '.candidates[] | select(.type == "eip") | .selection' candidates.json > selections.txt
-cat selections.txt
+**1. Filters.** Select by type and/or region; repeat each option as needed.
+
+```sh
+python aws_cleanup.py --delete-type eip --delete-type ebs --confirm-account 123456789012
+python aws_cleanup.py --delete-region us-east-2 --confirm-account 123456789012
+python aws_cleanup.py --delete-type nat --delete-region us-east-1 --confirm-account 123456789012
+python aws_cleanup.py --delete-all --confirm-account 123456789012     # every candidate
 ```
 
-Change the filter to select a different type, region, or other report fields.
-You can also edit `selections.txt` to choose individual resources; keep one exact
-selection per line. To select **every** candidate instead, including IAM users
-and EBS volumes, use the following command and carefully review the result:
+**2. Numbered menu.** Pick from a numbered list of candidates.
 
-```bash
-jq -r '.candidates[].selection' candidates.json > selections.txt
-cat selections.txt
+```sh
+python aws_cleanup.py --interactive --confirm-account 123456789012
 ```
 
-After review, use Bash to pass the selections to the script:
+At the prompt, enter one of the following:
 
-```bash
-args=()
-while IFS= read -r selection; do
-  args+=(--delete "$selection")
-done < selections.txt
+| Input | Effect |
+| --- | --- |
+| `1-5,8,12-14` | Ranges and/or comma-separated numbers |
+| `all` | Every listed candidate |
+| `ask` | Go through each item and answer `y`, `n` (default), or `q` to stop |
+| blank | Nothing; exit without deleting |
 
-python aws_cleanup.py --profile my-profile "${args[@]}" \
-  --confirm-account 123456789012
+**3. Plan file.** Write the report to an editable file. Delete the lines for anything you want to keep, then run
+it. Text after `#` is ignored.
+
+```sh
+python aws_cleanup.py --write-plan plan.txt > candidates.json
+vi plan.txt
+python aws_cleanup.py --from-file plan.txt --confirm-account 123456789012
 ```
 
-Use the same account and profile as the report. An empty list does not delete
-anything. Every selection must still be a candidate in a fresh scan, and each
-is rechecked before deletion. Large groups may take time because of these
-checks; very large lists can exceed the operating system's command-line length
-limit and must be split into smaller, separately reviewed batches. There is no
-built-in option to read selections from a file.
+Every selection in the plan must still be a candidate in the fresh scan; otherwise nothing is deleted.
+
+In all modes, each resource is rechecked before deletion, with one fresh scan per region and resource group.
+A change aborts the remaining deletions. Earlier deletions are not undone.
 
 The identity needs `sts:GetCallerIdentity`, EC2 describe permissions for regions,
 addresses, NAT gateways, route tables, internet gateways, volumes, network
@@ -155,4 +162,4 @@ python prefix_cleanup.py coepse --execute --confirm-account 123456789012
 
 The JSON output lists `resources`, plus `deleted` and `failed` after `--execute`.
 
-`--execute` needs the account ID and an interactive terminal. It also asks you to type `delete <prefix>`. Deletion runs in the order shown above. A failure is recorded, the remaining resources are still attempted, and the exit code is 1. Run it only after Terraform teardown. Otherwise Terraform state will still reference deleted resources. Objects in Object Lock buckets and zones with DNSSEC signing enabled must be handled manually.
+`--execute` needs the account ID and an interactive terminal. It shows a numbered list where you choose `all`, ranges and comma-separated numbers such as `1-3,6`, `ask` to decide each one, or blank for none. You then type `delete <prefix>` to confirm. Deletion runs in the order shown above. A failure is recorded, the remaining resources are still attempted, and the exit code is 1. Run it only after Terraform teardown. Otherwise Terraform state will still reference deleted resources. Objects in Object Lock buckets and zones with DNSSEC signing enabled must be handled manually.

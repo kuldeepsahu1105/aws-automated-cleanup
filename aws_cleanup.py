@@ -10,6 +10,9 @@ from datetime import datetime, timezone
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 
+TYPES = ("eip", "nat", "igw", "ebs", "sg", "key-pair", "efs", "elbv2", "classic-elb",
+         "target-group", "iam-user")
+
 
 def months_ago(now, months):
     month = now.month - 1 - months
@@ -219,14 +222,144 @@ def confirm_sensitive_deletion(selection):
         raise ValueError(f"Deletion not confirmed: {selection}")
 
 
-def run(session, selections, confirm_account, now):
+PER_ITEM_TYPES = ("iam-user", "efs", "key-pair", "sg")
+
+
+def confirm_batch(items):
+    """Confirm bulk types with one typed count; ask y/N for each per-item type. Returns approved items."""
+    bulk = [i for i in items if i["type"] not in PER_ITEM_TYPES]
+    single = [i for i in items if i["type"] in PER_ITEM_TYPES]
+    approved = set()
+    if bulk:
+        print(f"\nSelected {len(bulk)} resources for deletion:", file=sys.stderr)
+        for item in bulk:
+            print(f"  {item['selection']}  # {item['reason']}", file=sys.stderr)
+        if prompt(f"Type 'delete {len(bulk)}' to continue: ") != f"delete {len(bulk)}":
+            raise ValueError("Deletion not confirmed.")
+        approved.update(i["selection"] for i in bulk)
+    if single:
+        print(f"\nIAM users, EFS, key pairs and security groups are confirmed one at a time "
+              f"({len(single)}):", file=sys.stderr)
+        for number, item in enumerate(single, 1):
+            reply = prompt(f"[{number}/{len(single)}] delete {item['selection']}  # {item['reason']}? [y/N/q] ")
+            if reply.lower() == "q":
+                break
+            if reply.lower() in ("y", "yes"):
+                approved.add(item["selection"])
+    return [i["selection"] for i in items if i["selection"] in approved]
+
+
+def filter_chooser(types, regions):
+    def choose(candidates):
+        return [c["selection"] for c in candidates
+                if (not types or c["type"] in types) and (not regions or c["region"] in regions)]
+    return choose
+
+
+def parse_ranges(text, count):
+    text = text.strip().lower()
+    if text == "all":
+        return list(range(count))
+    chosen = set()
+    for part in filter(None, (p.strip() for p in text.split(","))):
+        start, _, end = part.partition("-")
+        try:
+            first, last = int(start), int(end or start)
+        except ValueError:
+            raise ValueError(f"Invalid selection: {part}") from None
+        if not 1 <= first <= last <= count:
+            raise ValueError(f"Invalid selection range: {part}")
+        chosen.update(range(first - 1, last))
+    return sorted(chosen)
+
+
+def prompt(message):
+    print(message, end="", file=sys.stderr, flush=True)
+    return sys.stdin.readline().strip()
+
+
+def pick(items, label):
+    """Numbered menu: 'all', ranges/commas like 1-5,8, 'ask' for y/n per item, blank for none."""
+    if not items:
+        return []
+    for number, item in enumerate(items, 1):
+        print(f"{number:4}. {label(item)}", file=sys.stderr)
+    answer = prompt("Delete which? 'all', numbers/ranges (e.g. 1-5,8), 'ask' for each, blank for none: ")
+    if answer.lower() == "ask":
+        chosen = []
+        for number, item in enumerate(items, 1):
+            reply = prompt(f"[{number}/{len(items)}] delete {label(item)}? [y/N/q] ").lower()
+            if reply == "q":
+                break
+            if reply in ("y", "yes"):
+                chosen.append(item)
+        return chosen
+    try:
+        return [items[i] for i in parse_ranges(answer, len(items))]
+    except ValueError as exc:
+        raise ValueError(f"Invalid menu input: {exc}") from None
+
+
+def interactive_chooser(candidates):
+    return [c["selection"] for c in pick(candidates, lambda c: f"{c['selection']}  # {c['reason']}")]
+
+
+def read_plan(path):
+    with open(path, encoding="utf-8") as handle:
+        lines = [line.split("#", 1)[0].strip() for line in handle]
+    selections = [line for line in lines if line]
+    if len(selections) != len(set(selections)):
+        raise ValueError(f"Duplicate selections in {path}")
+    return lambda candidates: selections
+
+
+def write_plan(path, candidates):
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write("# Delete the lines for resources you want to KEEP, then run:\n"
+                     f"#   aws_cleanup.py --from-file {path} --confirm-account <account>\n")
+        for item in candidates:
+            handle.write(f"{item['selection']}  # {item['reason']}\n")
+
+
+def fresh_selections(session, item, cache):
+    kind, region = item["type"], item["region"]
+    if kind == "iam-user":
+        group = "iam"
+    elif kind in ("elbv2", "classic-elb", "target-group"):
+        group = "lb"
+    elif kind in ("sg", "key-pair"):
+        group = "sg"
+    elif kind == "efs":
+        group = "efs"
+    else:
+        group = "ec2"
+    key = (group, region)
+    if key not in cache:
+        if group == "iam":
+            fresh, _ = scan_users(session.client("iam"), datetime.now(timezone.utc))
+        elif group == "lb":
+            fresh = scan_load_balancers(session, region)
+        elif group == "sg":
+            fresh = scan_security_groups_and_keys(session.client("ec2", region_name=region), region)
+        elif group == "efs":
+            fresh = scan_file_systems(session.client("efs", region_name=region), region)
+        else:
+            fresh = scan_region(session.client("ec2", region_name=region), region)
+        cache[key] = {entry["selection"] for entry in fresh}
+    return cache[key]
+
+
+def run(session, selections, confirm_account, now, chooser=None, plan_path=None):
     if not session.region_name:
         raise ValueError("Configure an AWS default region or set AWS_DEFAULT_REGION.")
     account = session.client("sts").get_caller_identity()["Account"]
-    if selections and confirm_account != account:
+    deleting = bool(selections) or chooser is not None
+    if deleting and confirm_account != account:
         raise ValueError(f"Deletion requires --confirm-account {account}.")
-    if confirm_account and not selections:
-        raise ValueError("--confirm-account requires at least one --delete selection.")
+    if confirm_account and not deleting:
+        raise ValueError("--confirm-account requires a deletion selection.")
+    if chooser is not None and not sys.stdin.isatty():
+        raise ValueError("Bulk deletion requires an interactive terminal.")
 
     discovery = session.client("ec2", region_name=session.region_name)
     regions = sorted(r["RegionName"] for r in discovery.describe_regions()["Regions"])
@@ -242,32 +375,29 @@ def run(session, selections, confirm_account, now):
     candidates.extend(users)
     candidates.sort(key=lambda item: item["selection"])
     by_selection = {item["selection"]: item for item in candidates}
+    if plan_path:
+        write_plan(plan_path, candidates)
+    if chooser is not None:
+        selections = chooser(candidates)
 
     unknown = set(selections) - by_selection.keys()
     if unknown:
         raise ValueError("Selections are not current candidates: " + ", ".join(sorted(unknown)))
 
-    if any(by_selection[selection]["type"] in ("sg", "key-pair") for selection in selections):
+    if chooser is not None:
+        if selections:
+            selections = confirm_batch([by_selection[s] for s in selections])
+    elif any(by_selection[selection]["type"] in ("sg", "key-pair") for selection in selections):
         if not sys.stdin.isatty():
             raise ValueError("Security group and key pair deletion requires an interactive terminal.")
 
     deleted = []
+    cache = {}
     for selection in selections:
         item = by_selection[selection]
-        if item["type"] in ("sg", "key-pair"):
+        if chooser is None and item["type"] in ("sg", "key-pair"):
             confirm_sensitive_deletion(selection)
-        if item["type"] == "iam-user":
-            fresh, _ = scan_users(session.client("iam"), datetime.now(timezone.utc))
-        elif item["type"] in ("elbv2", "classic-elb", "target-group"):
-            fresh = scan_load_balancers(session, item["region"])
-        elif item["type"] in ("sg", "key-pair"):
-            fresh = scan_security_groups_and_keys(session.client("ec2", region_name=item["region"]),
-                                                  item["region"])
-        elif item["type"] == "efs":
-            fresh = scan_file_systems(session.client("efs", region_name=item["region"]), item["region"])
-        else:
-            fresh = scan_region(session.client("ec2", region_name=item["region"]), item["region"])
-        if selection not in {entry["selection"] for entry in fresh}:
+        if selection not in fresh_selections(session, item, cache):
             raise ValueError(f"Candidate changed before deletion: {selection}; already submitted: {deleted}")
         delete_candidate(session, item)
         deleted.append(selection)
@@ -282,13 +412,35 @@ def main(argv=None):
     parser.add_argument("--delete", action="append", default=[], metavar="SELECTION",
                         help="Explicit selection from report; repeat for each resource")
     parser.add_argument("--confirm-account", help="Account ID required for deletion")
+    bulk = parser.add_argument_group("bulk deletion (preview + typed confirmation, interactive terminal)")
+    bulk.add_argument("--delete-all", action="store_true", help="Select every candidate (narrow with filters)")
+    bulk.add_argument("--delete-type", action="append", default=[], metavar="TYPE", choices=TYPES,
+                      help="Select candidates of this type; repeat for more")
+    bulk.add_argument("--delete-region", action="append", default=[], metavar="REGION",
+                      help="Select candidates in this region; repeat for more")
+    bulk.add_argument("--interactive", action="store_true", help="Pick candidates from a numbered menu")
+    bulk.add_argument("--from-file", metavar="PATH", help="Delete selections listed in a plan file")
+    parser.add_argument("--write-plan", metavar="PATH", help="Write candidates to an editable plan file")
     args = parser.parse_args(argv)
     if len(args.delete) != len(set(args.delete)):
         parser.error("Duplicate --delete selections are not allowed")
+    filtering = args.delete_all or args.delete_type or args.delete_region
+    modes = [bool(args.delete), bool(filtering), args.interactive, bool(args.from_file)]
+    if sum(modes) > 1:
+        parser.error("Use only one of --delete, --delete-all/--delete-type/--delete-region, "
+                     "--interactive or --from-file")
     try:
+        chooser = None
+        if filtering:
+            chooser = filter_chooser(set(args.delete_type), set(args.delete_region))
+        elif args.interactive:
+            chooser = interactive_chooser
+        elif args.from_file:
+            chooser = read_plan(args.from_file)
         session = boto3.Session(profile_name=args.profile)
-        result = run(session, args.delete, args.confirm_account, datetime.now(timezone.utc))
-    except (BotoCoreError, ClientError, ValueError) as exc:
+        result = run(session, args.delete, args.confirm_account, datetime.now(timezone.utc),
+                     chooser, args.write_plan)
+    except (BotoCoreError, ClientError, ValueError, OSError) as exc:
         print(f"Cleanup failed: {exc}", file=sys.stderr)
         return 1
     print(json.dumps(result, indent=2))

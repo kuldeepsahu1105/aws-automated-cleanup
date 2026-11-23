@@ -1,3 +1,5 @@
+import os
+import tempfile
 import unittest
 from datetime import datetime, timezone
 from unittest.mock import Mock, patch
@@ -213,6 +215,68 @@ class CleanupTests(unittest.TestCase):
                     result = cleanup.run(session, [item["selection"]], "123456789012", NOW)
                 self.assertEqual(result["deletion_submitted"], [item["selection"]])
                 getattr(ec2, method).assert_called_once()
+
+    def test_menu_ranges_and_ask_mode(self):
+        self.assertEqual(cleanup.parse_ranges("3, 1-2,2", 5), [0, 1, 2])
+        self.assertEqual(cleanup.parse_ranges("all", 3), [0, 1, 2])
+        self.assertEqual(cleanup.parse_ranges("", 3), [])
+        for bad in ("0", "4", "2-1", "x"):
+            with self.assertRaises(ValueError):
+                cleanup.parse_ranges(bad, 3)
+        with patch("aws_cleanup.sys.stdin") as stdin, patch("aws_cleanup.sys.stderr"):
+            stdin.readline.side_effect = ["ask\n", "y\n", "n\n", "q\n"]
+            self.assertEqual(cleanup.pick(["a", "b", "c", "d"], str), ["a"])
+
+    @patch("aws_cleanup.scan_load_balancers", return_value=[])
+    @patch("aws_cleanup.scan_users", return_value=([], []))
+    @patch("aws_cleanup.scan_file_systems", return_value=[])
+    @patch("aws_cleanup.scan_security_groups_and_keys")
+    @patch("aws_cleanup.scan_region")
+    def test_bulk_filter_and_plan_file(self, scan_region, scan_keys, scan_efs, scan_users, scan_lbs):
+        vol = cleanup.candidate("ebs", "vol-1", "us-east-1", "unattached")
+        eip = cleanup.candidate("eip", "eipalloc-1", "us-east-1", "unassociated")
+        sg = cleanup.candidate("sg", "sg-1", "us-east-1", "unused")
+        scan_region.return_value = [vol, eip]
+        scan_keys.return_value = [sg]
+        ec2 = Mock()
+        ec2.describe_regions.return_value = {"Regions": [{"RegionName": "us-east-1"}]}
+        sts = Mock()
+        sts.get_caller_identity.return_value = {"Account": "123456789012"}
+        session = Mock(region_name="us-east-1")
+        session.client.side_effect = lambda name, **kwargs: {"ec2": ec2, "sts": sts, "iam": Mock(), "efs": Mock()}[name]
+
+        with patch("aws_cleanup.sys.stdin") as stdin, patch("aws_cleanup.sys.stderr"):
+            stdin.isatty.return_value = True
+            stdin.readline.side_effect = ["delete 1\n"]
+            result = cleanup.run(session, [], "123456789012", NOW, cleanup.filter_chooser({"ebs"}, set()))
+            self.assertEqual(result["deletion_submitted"], [vol["selection"]])
+            ec2.release_address.assert_not_called()
+
+            stdin.readline.side_effect = ["delete 2\n", "n\n"]
+            result = cleanup.run(session, [], "123456789012", NOW, cleanup.filter_chooser(set(), set()))
+            ec2.delete_security_group.assert_not_called()
+            self.assertEqual(result["deletion_submitted"], [vol["selection"], eip["selection"]])
+
+            stdin.readline.side_effect = ["no\n"]
+            with self.assertRaisesRegex(ValueError, "not confirmed"):
+                cleanup.run(session, [], "123456789012", NOW, cleanup.filter_chooser({"ebs"}, set()))
+
+            stdin.readline.side_effect = ["y\n"]
+            result = cleanup.run(session, [], "123456789012", NOW, cleanup.filter_chooser({"sg"}, set()))
+            self.assertEqual(result["deletion_submitted"], [sg["selection"]])
+
+            stdin.isatty.return_value = False
+            with self.assertRaisesRegex(ValueError, "interactive terminal"):
+                cleanup.run(session, [], "123456789012", NOW, cleanup.filter_chooser(set(), set()))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            plan = os.path.join(tmp, "plan.txt")
+            cleanup.run(session, [], None, NOW, plan_path=plan)
+            with open(plan) as handle:
+                kept = [line for line in handle if not line.startswith(("ebs:", "sg:"))]
+            with open(plan, "w") as handle:
+                handle.writelines(kept)
+            self.assertEqual(cleanup.read_plan(plan)([]), [eip["selection"]])
 
     def test_new_delete_api_calls(self):
         session = Mock()
