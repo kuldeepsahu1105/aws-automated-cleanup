@@ -1,7 +1,8 @@
 # AWS cleanup candidates
 
-This script reports potentially unused resources across every region enabled for
-the current account. It is **report-only by default**. Candidates are not proof
+This repository has two scripts. `aws_cleanup.py` reports potentially unused resources across every region enabled for
+the current account. `prefix_cleanup.py` handles cleanup for one deployment prefix; see
+[Prefix cleanup](#prefix-cleanup). Both are **report-only by default**. Candidates are not proof
 that a resource can safely be deleted; review ownership, dependencies, backups,
 and future use before selecting anything.
 
@@ -130,3 +131,27 @@ IAM list permissions for users, access keys, signing certificates, SSH keys and
 service-specific credentials, plus `iam:GetAccessKeyLastUsed`. Deletion also
 requires the corresponding EC2, EFS, ELB/ELBv2, or IAM delete/release permissions.
 No AWS resources are changed unless deletion is explicitly requested.
+
+## Prefix cleanup
+
+`prefix_cleanup.py` finds global resources owned by one deployment prefix, such as `coepse`, after the stack has been torn down. For IAM resources and S3 buckets, the prefix must be a whole token in the name, separated by `-`, `_`, or `.`, at the start, middle, or end. For example, `coepse-csk-bastion-ssm` and `ccf-restricted-coepse-s3-policy` match. `coepsex-role` and `mycoepse` do not. A hosted zone matches only when its first label is the prefix, as in `coepse.example.com`.
+
+| Type | Deletion steps |
+| --- | --- |
+| `iam-user` | Deactivate, then delete access keys. Then delete the console password, signing certificates, SSH keys, service credentials, and MFA devices. Detach and delete policies, remove the user from groups, and delete the user. |
+| `instance-profile` | Remove the attached roles, then delete the profile. |
+| `iam-role` | Remove it from instance profiles, detach and delete policies, then delete the role. Service-linked roles are skipped. |
+| `iam-policy` | Customer-managed only. Detach it from all users, groups, and roles, delete old versions, then delete the policy. |
+| `s3-bucket` | Delete all object versions and delete markers, abort uploads, then delete the bucket in its own region. |
+| `hosted-zone` | Remove the NS delegation in a same-account parent zone, delete the records, then delete the zone. Public and private zones are both covered. |
+
+```sh
+python prefix_cleanup.py coepse                      # report only
+python prefix_cleanup.py coepse --profile my-profile > coepse.json
+python prefix_cleanup.py coepse --type s3-bucket --type hosted-zone   # limit types
+python prefix_cleanup.py coepse --execute --confirm-account 123456789012
+```
+
+The JSON output lists `resources`, plus `deleted` and `failed` after `--execute`.
+
+`--execute` needs the account ID and an interactive terminal. It also asks you to type `delete <prefix>`. Deletion runs in the order shown above. A failure is recorded, the remaining resources are still attempted, and the exit code is 1. Run it only after Terraform teardown. Otherwise Terraform state will still reference deleted resources. Objects in Object Lock buckets and zones with DNSSEC signing enabled must be handled manually.
