@@ -31,6 +31,16 @@ or IAM discovery aborts the scan instead of returning an incomplete report.
   traffic or cost history check.
 - **Internet gateway:** not attached to any VPC.
 - **EBS volume:** available and unattached; it may still contain needed data.
+- **Security group:** non-default group not attached to any network interface.
+  Other resources, security group rules, or future deployments may still depend
+  on it; default groups are excluded.
+- **EC2 key pair:** not referenced by any visible EC2 instance, including
+  terminated instances returned by AWS. Launch templates, Auto Scaling groups,
+  other services, future instances, or other accounts may still need the key.
+  Its presence on instances is not proof of actual SSH usage.
+- **EFS file system:** available with no mount targets. It can still contain
+  needed data or be used by services such as AWS Backup; check dependencies and
+  backups before deleting.
 - **Load balancer:** Classic, Application, Network, or Gateway load balancer
   without listeners.
 - **Target group:** no associated load balancer. Other services or future
@@ -64,6 +74,13 @@ stderr as they happen. Rechecking cannot eliminate races or establish that a
 resource is safe to remove. AWS may reject deletion due to dependencies or
 protection. IAM user deletion does **not** remove credentials, policies, group
 memberships, or other dependencies; AWS rejects users that still have them.
+
+For each selected security group or key pair, an interactive terminal is
+required and you must type its exact `selection` when prompted, even when using
+`--delete` and `--confirm-account`. Input cannot be piped or pre-approved. A
+missing or incorrect confirmation aborts the command; any earlier deletion
+requests are not undone. Other selected resources do not receive this additional
+prompt.
 
 ### Deleting a group
 
@@ -105,9 +122,11 @@ limit and must be split into smaller, separately reviewed batches. There is no
 built-in option to read selections from a file.
 
 The identity needs `sts:GetCallerIdentity`, EC2 describe permissions for regions,
-addresses, NAT gateways, route tables, internet gateways and volumes; ELB and
+addresses, NAT gateways, route tables, internet gateways, volumes, network
+interfaces, security groups, key pairs, and instances; EFS describe permissions
+for file systems and mount targets; ELB and
 ELBv2 describe permissions for load balancers, listeners and target groups; and
 IAM list permissions for users, access keys, signing certificates, SSH keys and
 service-specific credentials, plus `iam:GetAccessKeyLastUsed`. Deletion also
-requires the corresponding EC2, ELB/ELBv2, or IAM delete/release permissions.
+requires the corresponding EC2, EFS, ELB/ELBv2, or IAM delete/release permissions.
 No AWS resources are changed unless deletion is explicitly requested.

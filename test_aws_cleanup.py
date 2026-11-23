@@ -93,6 +93,31 @@ class CleanupTests(unittest.TestCase):
         found = cleanup.scan_load_balancers(session, "us-east-1")
         self.assertEqual({x["id"] for x in found}, {"arn:lb-free", "arn:tg-free", "classic-free"})
 
+    def test_security_groups_and_key_pairs(self):
+        ec2 = Client({
+            "describe_network_interfaces": page("NetworkInterfaces", [{"Groups": [{"GroupId": "sg-used"}]}]),
+            "describe_security_groups": page("SecurityGroups", [
+                {"GroupId": "sg-used", "GroupName": "used"},
+                {"GroupId": "sg-free", "GroupName": "free"},
+                {"GroupId": "sg-default", "GroupName": "default"}]),
+            "describe_instances": page("Reservations", [
+                {"Instances": [{"KeyName": "used"}, {}]}]),
+        }, describe_key_pairs=lambda: {"KeyPairs": [{"KeyName": "used", "KeyPairId": "key-used"},
+                                                    {"KeyName": "free", "KeyPairId": "key-free"}]})
+        found = cleanup.scan_security_groups_and_keys(ec2, "us-east-1")
+        self.assertEqual({(item["type"], item["id"]) for item in found},
+                         {("sg", "sg-free"), ("key-pair", "key-free")})
+
+    def test_efs_only_available_without_mount_targets(self):
+        efs = Client({
+            "describe_file_systems": page("FileSystems", [
+                {"FileSystemId": "fs-free", "LifeCycleState": "available"},
+                {"FileSystemId": "fs-used", "LifeCycleState": "available"},
+                {"FileSystemId": "fs-creating", "LifeCycleState": "creating"}]),
+            "describe_mount_targets": lambda k: [{"MountTargets": [{}] if k["FileSystemId"] == "fs-used" else []}],
+        })
+        self.assertEqual([x["id"] for x in cleanup.scan_file_systems(efs, "us-east-1")], ["fs-free"])
+
     def test_service_credentials_checks_truncated_responses(self):
         iam = Mock()
         iam.list_service_specific_credentials.side_effect = [
@@ -104,15 +129,17 @@ class CleanupTests(unittest.TestCase):
 
     @patch("aws_cleanup.scan_load_balancers", return_value=[])
     @patch("aws_cleanup.scan_users", return_value=([], []))
+    @patch("aws_cleanup.scan_file_systems", return_value=[])
+    @patch("aws_cleanup.scan_security_groups_and_keys", return_value=[])
     @patch("aws_cleanup.scan_region")
-    def test_region_failure_prevents_all_deletions(self, scan_region, scan_users, scan_lbs):
+    def test_region_failure_prevents_all_deletions(self, scan_region, scan_keys, scan_efs, scan_users, scan_lbs):
         item = cleanup.candidate("ebs", "vol-1", "region-a", "unattached")
         ec2 = Mock()
         ec2.describe_regions.return_value = {"Regions": [{"RegionName": "region-a"}, {"RegionName": "region-b"}]}
         sts = Mock()
         sts.get_caller_identity.return_value = {"Account": "123456789012"}
         session = Mock(region_name="region-a")
-        session.client.side_effect = lambda name, **kwargs: {"ec2": ec2, "sts": sts, "iam": Mock()}[name]
+        session.client.side_effect = lambda name, **kwargs: {"ec2": ec2, "sts": sts, "iam": Mock(), "efs": Mock()}[name]
         scan_region.side_effect = [[item], ValueError("region unavailable")]
         with self.assertRaisesRegex(ValueError, "region unavailable"):
             cleanup.run(session, [item["selection"]], "123456789012", NOW)
@@ -120,15 +147,17 @@ class CleanupTests(unittest.TestCase):
 
     @patch("aws_cleanup.scan_load_balancers", return_value=[])
     @patch("aws_cleanup.scan_users", return_value=([], []))
+    @patch("aws_cleanup.scan_file_systems", return_value=[])
+    @patch("aws_cleanup.scan_security_groups_and_keys", return_value=[])
     @patch("aws_cleanup.scan_region")
-    def test_report_and_recheck_before_deletion(self, scan_region, scan_users, scan_lbs):
+    def test_report_and_recheck_before_deletion(self, scan_region, scan_keys, scan_efs, scan_users, scan_lbs):
         item = cleanup.candidate("ebs", "vol-1", "us-east-1", "unattached")
         ec2 = Mock()
         ec2.describe_regions.return_value = {"Regions": [{"RegionName": "us-east-1"}]}
         sts = Mock()
         sts.get_caller_identity.return_value = {"Account": "123456789012"}
         session = Mock(region_name="us-east-1")
-        session.client.side_effect = lambda name, **kwargs: {"ec2": ec2, "sts": sts, "iam": Mock()}[name]
+        session.client.side_effect = lambda name, **kwargs: {"ec2": ec2, "sts": sts, "iam": Mock(), "efs": Mock()}[name]
         scan_region.return_value = [item]
         result = cleanup.run(session, [], None, NOW)
         self.assertEqual(result["candidates"], [item])
@@ -143,6 +172,56 @@ class CleanupTests(unittest.TestCase):
         result = cleanup.run(session, [item["selection"]], "123456789012", NOW)
         ec2.delete_volume.assert_called_once_with(VolumeId="vol-1")
         self.assertEqual(result["deletion_submitted"], [item["selection"]])
+
+    @patch("aws_cleanup.scan_load_balancers", return_value=[])
+    @patch("aws_cleanup.scan_users", return_value=([], []))
+    @patch("aws_cleanup.scan_file_systems", return_value=[])
+    @patch("aws_cleanup.scan_security_groups_and_keys")
+    @patch("aws_cleanup.scan_region", return_value=[])
+    def test_sensitive_deletions_require_individual_confirmation(
+            self, scan_region, scan_keys, scan_efs, scan_users, scan_lbs):
+        ec2, sts = Mock(), Mock()
+        ec2.describe_regions.return_value = {"Regions": [{"RegionName": "us-east-1"}]}
+        sts.get_caller_identity.return_value = {"Account": "123456789012"}
+        session = Mock(region_name="us-east-1")
+        session.client.side_effect = lambda name, **kwargs: {"ec2": ec2, "sts": sts, "iam": Mock(), "efs": Mock()}[name]
+        for kind, identifier, method in (("sg", "sg-1", "delete_security_group"),
+                                         ("key-pair", "key-1", "delete_key_pair")):
+            with self.subTest(kind=kind):
+                item = cleanup.candidate(kind, identifier, "us-east-1", "unused")
+                scan_keys.return_value = [item]
+                stdin = Mock()
+                stdin.isatty.return_value = False
+                with patch("aws_cleanup.sys.stdin", stdin):
+                    with self.assertRaisesRegex(ValueError, "interactive terminal"):
+                        cleanup.run(session, [item["selection"]], "123456789012", NOW)
+                getattr(ec2, method).assert_not_called()
+                stdin.isatty.return_value = True
+                stdin.readline.return_value = "no\n"
+                with patch("aws_cleanup.sys.stdin", stdin):
+                    with self.assertRaisesRegex(ValueError, "not confirmed"):
+                        cleanup.run(session, [item["selection"]], "123456789012", NOW)
+                getattr(ec2, method).assert_not_called()
+                stdin.readline.return_value = item["selection"] + "\n"
+                scan_keys.side_effect = [[item], []]
+                with patch("aws_cleanup.sys.stdin", stdin):
+                    with self.assertRaisesRegex(ValueError, "changed before deletion"):
+                        cleanup.run(session, [item["selection"]], "123456789012", NOW)
+                getattr(ec2, method).assert_not_called()
+                scan_keys.side_effect = None
+                with patch("aws_cleanup.sys.stdin", stdin):
+                    result = cleanup.run(session, [item["selection"]], "123456789012", NOW)
+                self.assertEqual(result["deletion_submitted"], [item["selection"]])
+                getattr(ec2, method).assert_called_once()
+
+    def test_new_delete_api_calls(self):
+        session = Mock()
+        client = session.client.return_value
+        for kind, identifier in (("sg", "sg-1"), ("key-pair", "key-1"), ("efs", "fs-1")):
+            cleanup.delete_candidate(session, cleanup.candidate(kind, identifier, "us-east-1", "candidate"))
+        client.delete_security_group.assert_called_once_with(GroupId="sg-1")
+        client.delete_key_pair.assert_called_once_with(KeyPairId="key-1")
+        client.delete_file_system.assert_called_once_with(FileSystemId="fs-1")
 
     def test_iam_delete_does_not_remove_dependencies(self):
         iam = Mock()

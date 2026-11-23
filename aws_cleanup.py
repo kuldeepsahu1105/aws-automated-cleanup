@@ -70,6 +70,47 @@ def scan_region(ec2, region):
     return results
 
 
+def scan_security_groups_and_keys(ec2, region):
+    results = []
+    attached_groups = {
+        group["GroupId"]
+        for interface in pages(ec2, "describe_network_interfaces", "NetworkInterfaces")
+        for group in interface.get("Groups", [])
+    }
+    for group in pages(ec2, "describe_security_groups", "SecurityGroups"):
+        if group["GroupName"] != "default" and group["GroupId"] not in attached_groups:
+            results.append(candidate("sg", group["GroupId"], region,
+                                     "Non-default security group not attached to a network interface",
+                                     name=group["GroupName"]))
+
+    instance_keys = {
+        instance["KeyName"]
+        for reservation in pages(ec2, "describe_instances", "Reservations")
+        for instance in reservation.get("Instances", [])
+        if instance.get("KeyName")
+    }
+    for key in ec2.describe_key_pairs()["KeyPairs"]:
+        if key["KeyName"] not in instance_keys:
+            if not key.get("KeyPairId"):
+                raise ValueError(f"Key pair ID missing for {key['KeyName']} in {region}")
+            results.append(candidate("key-pair", key["KeyPairId"], region,
+                                     "Key pair not referenced by any visible EC2 instance",
+                                     name=key["KeyName"]))
+    return results
+
+
+def scan_file_systems(efs, region):
+    results = []
+    for fs in pages(efs, "describe_file_systems", "FileSystems"):
+        if fs["LifeCycleState"] != "available":
+            continue
+        targets = pages(efs, "describe_mount_targets", "MountTargets", FileSystemId=fs["FileSystemId"])
+        if next(targets, None) is None:
+            results.append(candidate("efs", fs["FileSystemId"], region,
+                                     "EFS file system has no mount targets; it may still contain needed data"))
+    return results
+
+
 def scan_load_balancers(session, region):
     results = []
     elbv2 = session.client("elbv2", region_name=region)
@@ -151,6 +192,9 @@ def delete_candidate(session, item):
     if kind == "target-group":
         session.client("elbv2", region_name=region).delete_target_group(TargetGroupArn=identifier)
         return
+    if kind == "efs":
+        session.client("efs", region_name=region).delete_file_system(FileSystemId=identifier)
+        return
     ec2 = session.client("ec2", region_name=region)
     if kind == "eip":
         ec2.release_address(AllocationId=identifier)
@@ -160,8 +204,19 @@ def delete_candidate(session, item):
         ec2.delete_internet_gateway(InternetGatewayId=identifier)
     elif kind == "ebs":
         ec2.delete_volume(VolumeId=identifier)
+    elif kind == "sg":
+        ec2.delete_security_group(GroupId=identifier)
+    elif kind == "key-pair":
+        ec2.delete_key_pair(KeyPairId=identifier)
     else:
         raise ValueError(f"Unknown resource type: {kind}")
+
+
+def confirm_sensitive_deletion(selection):
+    print(f"Confirm deletion of {selection}. Type the exact selection to continue: ",
+          end="", file=sys.stderr, flush=True)
+    if sys.stdin.readline().rstrip("\r\n") != selection:
+        raise ValueError(f"Deletion not confirmed: {selection}")
 
 
 def run(session, selections, confirm_account, now):
@@ -180,6 +235,8 @@ def run(session, selections, confirm_account, now):
     candidates = []
     for region in regions:
         candidates.extend(scan_region(session.client("ec2", region_name=region), region))
+        candidates.extend(scan_security_groups_and_keys(session.client("ec2", region_name=region), region))
+        candidates.extend(scan_file_systems(session.client("efs", region_name=region), region))
         candidates.extend(scan_load_balancers(session, region))
     users, excluded_users = scan_users(session.client("iam"), now)
     candidates.extend(users)
@@ -190,13 +247,24 @@ def run(session, selections, confirm_account, now):
     if unknown:
         raise ValueError("Selections are not current candidates: " + ", ".join(sorted(unknown)))
 
+    if any(by_selection[selection]["type"] in ("sg", "key-pair") for selection in selections):
+        if not sys.stdin.isatty():
+            raise ValueError("Security group and key pair deletion requires an interactive terminal.")
+
     deleted = []
     for selection in selections:
         item = by_selection[selection]
+        if item["type"] in ("sg", "key-pair"):
+            confirm_sensitive_deletion(selection)
         if item["type"] == "iam-user":
             fresh, _ = scan_users(session.client("iam"), datetime.now(timezone.utc))
         elif item["type"] in ("elbv2", "classic-elb", "target-group"):
             fresh = scan_load_balancers(session, item["region"])
+        elif item["type"] in ("sg", "key-pair"):
+            fresh = scan_security_groups_and_keys(session.client("ec2", region_name=item["region"]),
+                                                  item["region"])
+        elif item["type"] == "efs":
+            fresh = scan_file_systems(session.client("efs", region_name=item["region"]), item["region"])
         else:
             fresh = scan_region(session.client("ec2", region_name=item["region"]), item["region"])
         if selection not in {entry["selection"] for entry in fresh}:
