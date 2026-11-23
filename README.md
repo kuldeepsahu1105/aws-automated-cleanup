@@ -17,6 +17,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 python aws_cleanup.py --profile my-profile > candidates.json
+python -m unittest discover -s tests   # run the tests
 ```
 
 Omit `--profile` to use the standard AWS credential chain. The JSON report
