@@ -9,14 +9,16 @@ and future use before selecting anything.
 ## Setup
 
 Requires Python 3.9+ and AWS credentials. Configure a default AWS region in your
-profile or `AWS_DEFAULT_REGION`; it is used to discover enabled regions, not to
-limit the scan.
+profile or `AWS_DEFAULT_REGION`; by default the script discovers and scans all
+enabled regions. Pass `--region` to scan only one region.
 
 ```sh
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 python aws_cleanup.py --profile my-profile > candidates.json
+python aws_cleanup.py --profile my-profile --region us-east-2 > us-east-2.json
+python aws_cleanup.py --profile my-profile --log-file cleanup.log
 python -m unittest discover -s tests   # run the tests
 ```
 
@@ -24,6 +26,15 @@ Omit `--profile` to use the standard AWS credential chain. The JSON report
 includes the account, scanned regions, candidates, and IAM users excluded because
 their credentials lack comparable last-used timestamps. A failure in any region
 or IAM discovery aborts the scan instead of returning an incomplete report.
+When `--region` is provided, that region must be enabled for the account; it is
+the only region scanned, and it can also supply the AWS API region if no default
+region is configured. Global IAM users are still scanned because IAM is not
+region-scoped.
+Progress logs go to stderr by default, leaving stdout available for JSON output.
+They show each regional scan, candidates found by type/name/region, empty
+candidate types, and deletion outcomes. Console logs use color when stderr is a
+terminal; set `NO_COLOR` to disable it. `--log-file` also writes timestamped,
+plain-text logs to a file, and `--log-level DEBUG` increases verbosity.
 
 ## Candidate criteria
 
@@ -71,8 +82,10 @@ python aws_cleanup.py --profile my-profile \
 ```
 
 Repeat `--delete` for multiple selections. Deletion is not transactional: a
-later error does not undo earlier requests. Submitted requests are printed to
-stderr as they happen. Rechecking cannot eliminate races or establish that a
+later error does not undo earlier requests. Deletion attempts and successful AWS
+requests are logged with the resource type, name, and region as they happen.
+Some AWS deletions are asynchronous, so a successful request is not always proof
+that the resource is fully gone. Rechecking cannot eliminate races or establish that a
 resource is safe to remove. AWS may reject deletion due to dependencies or
 protection. IAM user deletion does **not** remove credentials, policies, group
 memberships, or other dependencies; AWS rejects users that still have them.

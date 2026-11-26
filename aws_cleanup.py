@@ -4,6 +4,8 @@
 import argparse
 import calendar
 import json
+import logging
+import os
 import sys
 from datetime import datetime, timezone
 
@@ -12,6 +14,29 @@ from botocore.exceptions import BotoCoreError, ClientError
 
 TYPES = ("eip", "nat", "igw", "ebs", "sg", "key-pair", "efs", "elbv2", "classic-elb",
          "target-group", "iam-user")
+logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())
+
+LEVEL_COLORS = {
+    logging.DEBUG: "\033[2m",
+    logging.INFO: "\033[36m",
+    logging.WARNING: "\033[33m",
+    logging.ERROR: "\033[31m",
+    logging.CRITICAL: "\033[1;31m",
+}
+
+
+class ConsoleFormatter(logging.Formatter):
+    def __init__(self, color):
+        super().__init__("%(asctime)s  %(levelname)-8s %(message)s", datefmt="%H:%M:%S")
+        self.color = color
+
+    def format(self, record):
+        message = super().format(record)
+        if self.color:
+            color = LEVEL_COLORS.get(record.levelno, "")
+            return f"{color}{message}\033[0m" if color else message
+        return message
 
 
 def months_ago(now, months):
@@ -349,10 +374,27 @@ def fresh_selections(session, item, cache):
     return cache[key]
 
 
-def run(session, selections, confirm_account, now, chooser=None, plan_path=None):
-    if not session.region_name:
+def log_scan_results(scope, candidates, types):
+    for kind in types:
+        logger.debug("Checking scan results for %s in %s", kind, scope)
+        found = [item for item in candidates if item["type"] == kind]
+        if not found:
+            logger.info("Not found: %s in %s", kind, scope)
+            continue
+        logger.info("Found %d %s candidate(s) in %s", len(found), kind, scope)
+        for item in found:
+            name = item.get("name", item["id"])
+            logger.info("Found candidate: type=%s name=%s region=%s selection=%s",
+                        kind, name, item["region"], item["selection"])
+            logger.debug("Candidate details: %r", item)
+
+
+def run(session, selections, confirm_account, now, chooser=None, plan_path=None, region=None):
+    discovery_region = region or session.region_name
+    if not discovery_region:
         raise ValueError("Configure an AWS default region or set AWS_DEFAULT_REGION.")
-    account = session.client("sts").get_caller_identity()["Account"]
+    account = session.client("sts", region_name=discovery_region).get_caller_identity()["Account"]
+    logger.info("Starting AWS cleanup scan for account %s", account)
     deleting = bool(selections) or chooser is not None
     if deleting and confirm_account != account:
         raise ValueError(f"Deletion requires --confirm-account {account}.")
@@ -361,22 +403,50 @@ def run(session, selections, confirm_account, now, chooser=None, plan_path=None)
     if chooser is not None and not sys.stdin.isatty():
         raise ValueError("Bulk deletion requires an interactive terminal.")
 
-    discovery = session.client("ec2", region_name=session.region_name)
-    regions = sorted(r["RegionName"] for r in discovery.describe_regions()["Regions"])
-    if not regions:
+    discovery = session.client("ec2", region_name=discovery_region)
+    enabled_regions = sorted(r["RegionName"] for r in discovery.describe_regions()["Regions"])
+    if not enabled_regions:
         raise ValueError("AWS returned no enabled regions; refusing to proceed.")
+    if region and region not in enabled_regions:
+        raise ValueError(f"Region {region} is not enabled for this account.")
+    regions = [region] if region else enabled_regions
+    if region:
+        logger.info("Region filter set to %s; scanning only that region", region)
+    logger.info("Scanning %d enabled AWS regions", len(regions))
     candidates = []
+    regional_types = tuple(kind for kind in TYPES if kind != "iam-user")
     for region in regions:
-        candidates.extend(scan_region(session.client("ec2", region_name=region), region))
-        candidates.extend(scan_security_groups_and_keys(session.client("ec2", region_name=region), region))
-        candidates.extend(scan_file_systems(session.client("efs", region_name=region), region))
-        candidates.extend(scan_load_balancers(session, region))
+        logger.info("Scanning region %s", region)
+        region_start = len(candidates)
+        try:
+            logger.info("  Scan: Elastic IPs, NAT gateways, internet gateways, EBS volumes")
+            candidates.extend(scan_region(session.client("ec2", region_name=region), region))
+            logger.info("  Scan: security groups and EC2 key pairs")
+            candidates.extend(scan_security_groups_and_keys(session.client("ec2", region_name=region), region))
+            logger.info("  Scan: EFS file systems and mount targets")
+            candidates.extend(scan_file_systems(session.client("efs", region_name=region), region))
+            logger.info("  Scan: load balancers, listeners, and target groups")
+            candidates.extend(scan_load_balancers(session, region))
+        except (BotoCoreError, ClientError, ValueError) as exc:
+            logger.error("Scan failed in region %s; refusing partial results: %s", region, exc)
+            raise
+        log_scan_results(region, candidates[region_start:], regional_types)
+        logger.info("Region scan complete: %d candidate(s) in %s",
+                    len(candidates) - region_start, region)
+    logger.info("Scanning global IAM users")
     users, excluded_users = scan_users(session.client("iam"), now)
     candidates.extend(users)
+    log_scan_results("global", users, ("iam-user",))
+    for excluded in excluded_users:
+        logger.info("Not assessed: IAM user %s (%s)", excluded["user"], excluded["reason"])
     candidates.sort(key=lambda item: item["selection"])
+    logger.info("Found %d IAM candidates; excluded %d users with unassessed credentials",
+                len(users), len(excluded_users))
+    logger.info("Scan complete: %d candidates across %d regions", len(candidates), len(regions))
     by_selection = {item["selection"]: item for item in candidates}
     if plan_path:
         write_plan(plan_path, candidates)
+        logger.info("Wrote candidate plan to %s", plan_path)
     if chooser is not None:
         selections = chooser(candidates)
 
@@ -395,20 +465,59 @@ def run(session, selections, confirm_account, now, chooser=None, plan_path=None)
     cache = {}
     for selection in selections:
         item = by_selection[selection]
+        name = item.get("name", item["id"])
         if chooser is None and item["type"] in ("sg", "key-pair"):
             confirm_sensitive_deletion(selection)
         if selection not in fresh_selections(session, item, cache):
+            logger.warning("Candidate no longer qualifies; skipping remaining deletion batch: "
+                           "type=%s name=%s region=%s selection=%s",
+                           item["type"], name, item["region"], selection)
             raise ValueError(f"Candidate changed before deletion: {selection}; already submitted: {deleted}")
-        delete_candidate(session, item)
+        logger.info("Deleting candidate: type=%s name=%s region=%s selection=%s",
+                    item["type"], name, item["region"], selection)
+        try:
+            delete_candidate(session, item)
+        except (BotoCoreError, ClientError, ValueError) as exc:
+            logger.error("Deletion failed: type=%s name=%s region=%s selection=%s: %s",
+                         item["type"], name, item["region"], selection, exc)
+            raise
         deleted.append(selection)
-        print(f"Deletion submitted: {selection}", file=sys.stderr)
+        logger.info("Deletion request submitted successfully: type=%s name=%s region=%s selection=%s",
+                    item["type"], name, item["region"], selection)
+    if not deleted:
+        logger.info("No deletion requests submitted")
+    else:
+        logger.info("Deletion run complete: %d requests submitted", len(deleted))
     return {"account": account, "regions": regions, "candidates": candidates,
             "excluded_iam_users": excluded_users, "deletion_submitted": deleted}
+
+
+def configure_logging(level, log_file=None):
+    console = logging.StreamHandler(sys.stderr)
+    console.setFormatter(ConsoleFormatter(
+        color=sys.stderr.isatty() and "NO_COLOR" not in os.environ
+    ))
+    handlers = [console]
+    if log_file:
+        file_handler = logging.FileHandler(log_file, encoding="utf-8")
+        file_handler.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)-8s %(name)s: %(message)s"
+        ))
+        handlers.append(file_handler)
+    logging.basicConfig(
+        level=getattr(logging, level),
+        handlers=handlers,
+        force=True,
+    )
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--profile", help="AWS shared configuration profile")
+    parser.add_argument("--region", help="Scan only this AWS region (default: all enabled regions)")
+    parser.add_argument("--log-level", choices=("DEBUG", "INFO", "WARNING", "ERROR"),
+                        default="INFO", help="Logging verbosity (default: INFO)")
+    parser.add_argument("--log-file", help="Also write logs to this file")
     parser.add_argument("--delete", action="append", default=[], metavar="SELECTION",
                         help="Explicit selection from report; repeat for each resource")
     parser.add_argument("--confirm-account", help="Account ID required for deletion")
@@ -422,6 +531,11 @@ def main(argv=None):
     bulk.add_argument("--from-file", metavar="PATH", help="Delete selections listed in a plan file")
     parser.add_argument("--write-plan", metavar="PATH", help="Write candidates to an editable plan file")
     args = parser.parse_args(argv)
+    try:
+        configure_logging(args.log_level, args.log_file)
+    except OSError as exc:
+        print(f"Could not configure logging: {exc}", file=sys.stderr)
+        return 1
     if len(args.delete) != len(set(args.delete)):
         parser.error("Duplicate --delete selections are not allowed")
     filtering = args.delete_all or args.delete_type or args.delete_region
@@ -439,9 +553,9 @@ def main(argv=None):
             chooser = read_plan(args.from_file)
         session = boto3.Session(profile_name=args.profile)
         result = run(session, args.delete, args.confirm_account, datetime.now(timezone.utc),
-                     chooser, args.write_plan)
+                     chooser, args.write_plan, args.region)
     except (BotoCoreError, ClientError, ValueError, OSError) as exc:
-        print(f"Cleanup failed: {exc}", file=sys.stderr)
+        logger.error("Cleanup failed: %s", exc)
         return 1
     print(json.dumps(result, indent=2))
     return 0

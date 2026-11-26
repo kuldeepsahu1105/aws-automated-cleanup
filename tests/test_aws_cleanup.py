@@ -1,3 +1,4 @@
+import logging
 import os
 import tempfile
 import unittest
@@ -33,6 +34,42 @@ def page(key, items):
 
 
 class CleanupTests(unittest.TestCase):
+    @patch("aws_cleanup.scan_load_balancers", return_value=[])
+    @patch("aws_cleanup.scan_users", return_value=([], []))
+    @patch("aws_cleanup.scan_file_systems", return_value=[])
+    @patch("aws_cleanup.scan_security_groups_and_keys", return_value=[])
+    @patch("aws_cleanup.scan_region", return_value=[])
+    def test_explicit_region_limits_scan_without_default_region(
+            self, scan_region, scan_keys, scan_efs, scan_users, scan_lbs):
+        ec2 = Mock()
+        ec2.describe_regions.return_value = {
+            "Regions": [{"RegionName": "us-east-1"}, {"RegionName": "us-east-2"}]
+        }
+        sts = Mock()
+        sts.get_caller_identity.return_value = {"Account": "123456789012"}
+        session = Mock(region_name=None)
+        session.client.side_effect = lambda name, **kwargs: {"ec2": ec2, "sts": sts, "iam": Mock(),
+                                                              "efs": Mock()}[name]
+
+        result = cleanup.run(session, [], None, NOW, region="us-east-2")
+
+        self.assertEqual(result["regions"], ["us-east-2"])
+        session.client.assert_any_call("sts", region_name="us-east-2")
+        session.client.assert_any_call("ec2", region_name="us-east-2")
+        scan_region.assert_called_once_with(ec2, "us-east-2")
+        scan_keys.assert_called_once_with(ec2, "us-east-2")
+        scan_efs.assert_called_once()
+        scan_lbs.assert_called_once()
+
+    def test_log_formatter_colors_console_only(self):
+        record = logging.LogRecord("aws_cleanup", logging.INFO, "", 0, "scan complete", (), None)
+        colored = cleanup.ConsoleFormatter(color=True).format(record)
+        plain = cleanup.ConsoleFormatter(color=False).format(record)
+        self.assertIn("\033[36m", colored)
+        self.assertTrue(colored.endswith("\033[0m"))
+        self.assertNotIn("\033[", plain)
+        self.assertIn("INFO", plain)
+
     def test_calendar_month_cutoff(self):
         self.assertEqual(cleanup.months_ago(datetime(2024, 11, 30, tzinfo=timezone.utc), 9),
                          datetime(2024, 2, 29, tzinfo=timezone.utc))
@@ -161,7 +198,12 @@ class CleanupTests(unittest.TestCase):
         session = Mock(region_name="us-east-1")
         session.client.side_effect = lambda name, **kwargs: {"ec2": ec2, "sts": sts, "iam": Mock(), "efs": Mock()}[name]
         scan_region.return_value = [item]
-        result = cleanup.run(session, [], None, NOW)
+        with self.assertLogs("aws_cleanup", level="INFO") as captured:
+            result = cleanup.run(session, [], None, NOW)
+        logs = "\n".join(captured.output)
+        self.assertIn("Scanning region us-east-1", logs)
+        self.assertIn("Found candidate: type=ebs name=vol-1 region=us-east-1", logs)
+        self.assertIn("Not found: eip in us-east-1", logs)
         self.assertEqual(result["candidates"], [item])
         ec2.delete_volume.assert_not_called()
         with self.assertRaises(ValueError):
