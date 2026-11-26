@@ -1,8 +1,10 @@
 # AWS cleanup candidates
 
-This repository has two scripts. `aws_cleanup.py` reports potentially unused resources across every region enabled for
+`aws_cleanup.py` reports potentially unused resources across every region enabled for
 the current account. `prefix_cleanup.py` handles cleanup for one deployment prefix; see
-[Prefix cleanup](#prefix-cleanup). Both are **report-only by default**. Candidates are not proof
+[Prefix cleanup](#prefix-cleanup). For full environment teardown, including VPC
+dependencies, use [`cleanup.sh`](#full-environment-cleanup).
+All are **report-only by default**. Candidates are not proof
 that a resource can safely be deleted; review ownership, dependencies, backups,
 and future use before selecting anything.
 
@@ -176,3 +178,104 @@ python prefix_cleanup.py coepse --execute --confirm-account 123456789012
 The JSON output lists `resources`, plus `deleted` and `failed` after `--execute`.
 
 `--execute` needs the account ID and an interactive terminal. It shows a numbered list where you choose `all`, ranges and comma-separated numbers such as `1-3,6`, `ask` to decide each one, or blank for none. You then type `delete <prefix>` to confirm. Deletion runs in the order shown above. A failure is recorded, the remaining resources are still attempted, and the exit code is 1. Run it only after Terraform teardown. Otherwise Terraform state will still reference deleted resources. Objects in Object Lock buckets and zones with DNSSEC signing enabled must be handled manually.
+
+## Full environment cleanup
+
+`cleanup.sh` is a shell entry point for `environment_cleanup.py`, using the same
+Python/boto3 installation as the other scripts. It replaces the supplied
+best-effort shell teardown: no AWS CLI or `jq` is needed. Keep it alongside
+`environment_cleanup.py`, `aws_cleanup.py`, and `prefix_cleanup.py`.
+
+**This is destructive environment teardown, not an unused-resource detector.**
+A selected VPC includes every workload in that VPC, even workloads with other
+names or no tags. Only use VPC ownership tags for dedicated environments.
+Prefer Terraform destroy first when Terraform manages the resources; deleting
+outside Terraform leaves its state out of sync.
+
+Activate the virtualenv from [Setup](#setup), then:
+
+```sh
+# Report only, across all enabled regions; JSON on stdout, progress on stderr.
+bash cleanup.sh --profile my-profile --prefix coepse --log-file cleanup.log > plan.json
+
+# Limit regional resources AND S3 buckets to one region.
+bash cleanup.sh --profile my-profile --prefix coepse --region us-east-2
+
+# Execute after reviewing the fresh inventory and confirming the account.
+bash cleanup.sh --profile my-profile --prefix coepse --region us-east-2 \
+  --execute --confirm-account 123456789012 --log-file cleanup.log
+
+# Multiple environments; omit --region to cover all enabled regions.
+bash cleanup.sh --profile my-profile --prefix coepse --prefix testga
+```
+
+`--execute` offers a numbered menu: `all`, ranges/commas such as `1-4,8`, `ask`
+for yes/no per entry, or blank to cancel. A VPC is a single cascading selection;
+its dependencies are shown in the JSON report and removed in dependency order.
+Type `delete <account>` to confirm. IAM users, EFS data, key pairs, and security
+groups also require per-resource confirmation. Declining a dependent SG skips
+the whole VPC before any of its deletion steps start.
+
+### Ownership and coverage
+
+VPCs require an exact `Prefix`, `Project`, `InstallPrefix`, or `EnvironmentName`
+tag matching a requested prefix. Default VPCs are never selected. Other regional
+resources match those tags, or a token in the resource name/`Name` tag when
+explicit ownership tags are absent. An explicit foreign ownership tag prevents
+a name-only match. Tokens may appear at the beginning, middle, or end, separated
+by `-`, `_`, or `.`; `coepse2` does not match `coepse`.
+
+| Resource | Cleanup behavior |
+| --- | --- |
+| Auto Scaling / EC2 | Delete selected Auto Scaling groups first so they cannot recreate instances. Disable termination protection, terminate instances, and wait. Prefix-owned standalone instances are also included. |
+| EBS | Include prefix-owned volumes and volumes attached to selected instances, including data volumes retained after termination. Never force-detach a volume; surviving attachments block deletion. |
+| EFS | Remove mount targets and access points before deleting a prefix-owned file system and its data. For an unselected file system, VPC teardown removes only mount targets in the selected VPC and preserves the file system/data. |
+| ELB / target groups | Cover Classic, Application, Network, and Gateway LBs. Disable LB deletion protection, delete LBs, and wait for deletion and target-group detachment. Never delete a standalone TG still attached to a surviving LB. |
+| EIPs | Release unassociated prefix-owned addresses and allocations previously belonging to selected VPCs/instances/NATs. Reassigned or still-associated addresses are preserved or reported as blocked, never forcibly disassociated. |
+| Key pairs | Prefix-owned keys only. Refuse deletion while referenced by a live EC2 instance, launch-template version, or launch configuration. |
+| Security groups | Never delete default SGs. Remove references among selected groups before deletion, including cycles. Refuse standalone SG cleanup while ENIs are attached; do not edit incoming rules in unselected groups. |
+| VPC networking | Wait for NATs, endpoints, load balancers, EFS mounts, and instances. Delete free user-owned ENIs, peering connections in either direction, egress-only gateways, custom route tables (including unassociated ones), subnets, custom ACLs, and IGWs. Detach VPN gateways without deleting shared VPN infrastructure. Delete the VPC last. |
+| IAM | Delete prefix-matched users and their credentials, instance profiles, roles, and customer-managed policies in dependency order. Deactivate user access keys before deleting them. Preserve service-linked roles, the current caller, policies still used by surviving principals/boundaries, and profiles still used by instances in any enabled region. |
+| S3 | Prefix-matched buckets: delete all object versions/delete markers, abort incomplete uploads, then delete the bucket in its own region. Individual object-deletion errors are not hidden. Retention and MFA protections are not bypassed. |
+| Route 53 | Only zones whose first label equals the prefix, public or private. Remove matching same-account parent NS delegation, delete all non-apex records (including child NS records), then delete the zone. Shared parent zones are preserved. DNSSEC-enabled public zones require manual signing/DS review before any record changes. |
+
+IAM and Route 53 remain global even with `--region`; S3 respects the region
+filter. `--skip-global` excludes IAM, S3, and Route 53 entirely.
+
+### Failure handling and logs
+
+Rerunning is supported: a fresh inventory omits deleted resources, and
+resource-specific not-found responses are logged as `ALREADY ABSENT`. Active
+deletions are polled instead of using fixed sleeps as proof of completion.
+Dependency/eventual-consistency conflicts receive bounded retries; permission
+errors fail without being disguised as missing resources. `--timeout 900` and
+`--poll-interval 10` control waits (seconds, per dependency). Deletions are not
+transactional, and interrupted requests can continue in AWS.
+
+The final JSON includes `deletion_submitted`, `already_absent`, `failed`, and
+`skipped`. Any failure returns exit code 1. Independent regional resources can
+still be attempted; global deletion is skipped after an earlier failure or
+declined regional deletion to avoid removing credentials/data needed for
+recovery. Successful requests can be asynchronous and are not represented as
+proof that AWS has finished deleting.
+
+Console logs have timestamps, aligned type/region/name/ID fields, and scan,
+found/no-match, wait, success, skipped, retry, and failure statuses. Colors are
+automatic on terminals: cyan progress, green accepted requests, yellow
+warnings, red failures, and dim already-absent messages. `--log-file` appends
+plain text; `NO_COLOR=1` disables terminal color. `--log-level DEBUG` enables
+application detail without dumping AWS SDK request/credential traces.
+
+This is not a universal deleter for every AWS service. RDS, EKS, Lambda,
+Network Firewall, and other service-owned ENIs must be removed through their
+own service; the script never force-detaches them. Transit Gateway attachments
+and standalone Spot/Fleet controllers require manual review. On failure it
+prints remaining ENI descriptions/IDs and other VPC dependencies rather than
+claiming success or repeatedly deleting the VPC blindly. Unknown dependencies
+and shared/external references can still block teardown.
+
+The identity needs read/list permissions for the services above and, only for
+execution, the corresponding terminate/delete/detach/revoke/update APIs.
+Cross-region EC2 reads protect IAM instance profiles; IAM policy-usage reads
+protect surviving principals. No missing permission is silently treated as
+an empty inventory.

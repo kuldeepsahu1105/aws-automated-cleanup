@@ -26,6 +26,41 @@ def page(key, items):
 
 
 class PrefixCleanupTests(unittest.TestCase):
+    def test_s3_discovery_paginates_and_normalizes_legacy_eu_region(self):
+        iam = client()
+        route53 = client()
+        s3 = client()
+        s3.list_buckets.side_effect = [
+            {"Buckets": [{"Name": "unrelated"}], "ContinuationToken": "next"},
+            {"Buckets": [{"Name": "coepse-data"}]},
+        ]
+        s3.get_bucket_location.return_value = {"LocationConstraint": "EU"}
+        session = MagicMock()
+        session.client.side_effect = lambda name, **kwargs: {"iam": iam, "s3": s3, "route53": route53}[name]
+        found = pc.scan(session, "coepse")
+        self.assertEqual(found, [{"type": "s3-bucket", "id": "coepse-data", "region": "eu-west-1"}])
+        s3.list_buckets.assert_any_call(ContinuationToken="next")
+
+    def test_s3_versions_markers_and_uploads_are_cleaned_before_bucket(self):
+        s3 = client({
+            "list_object_versions": page("Versions", [{"Key": "data", "VersionId": "v1"}]),
+            "list_multipart_uploads": page("Uploads", [{"Key": "upload", "UploadId": "u1"}]),
+        })
+        s3.delete_objects.return_value = {}
+        pc.delete_bucket(s3, "coepse-data")
+        s3.delete_objects.assert_called_once_with(
+            Bucket="coepse-data", Delete={"Objects": [{"Key": "data", "VersionId": "v1"}], "Quiet": True})
+        calls = [call[0] for call in s3.method_calls]
+        self.assertLess(calls.index("delete_objects"), calls.index("delete_bucket"))
+        self.assertLess(calls.index("abort_multipart_upload"), calls.index("delete_bucket"))
+
+    def test_s3_partial_delete_errors_prevent_bucket_deletion(self):
+        s3 = client({"list_object_versions": page("DeleteMarkers", [{"Key": "data", "VersionId": "v1"}])})
+        s3.delete_objects.return_value = {"Errors": [{"Code": "AccessDenied", "Key": "data"}]}
+        with self.assertRaisesRegex(ValueError, "AccessDenied"):
+            pc.delete_bucket(s3, "coepse-data")
+        s3.delete_bucket.assert_not_called()
+
     def test_token_match(self):
         for name in ("coepse", "coepse-csk-bastion-ssm", "ccf-restricted-coepse-s3-policy", "COEPSE_x",
                      "bucket-coepse"):

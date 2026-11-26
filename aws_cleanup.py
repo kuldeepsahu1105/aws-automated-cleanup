@@ -35,6 +35,9 @@ class ConsoleFormatter(logging.Formatter):
         message = super().format(record)
         if self.color:
             color = LEVEL_COLORS.get(record.levelno, "")
+            if record.levelno == logging.INFO:
+                color = {"success": "\033[32m", "absent": "\033[2m"}.get(
+                    getattr(record, "event", ""), color)
             return f"{color}{message}\033[0m" if color else message
         return message
 
@@ -509,6 +512,8 @@ def configure_logging(level, log_file=None):
         handlers=handlers,
         force=True,
     )
+    for name in ("boto3", "botocore", "urllib3"):
+        logging.getLogger(name).setLevel(logging.WARNING)
 
 
 def main(argv=None):

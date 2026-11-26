@@ -69,6 +69,8 @@ class CleanupTests(unittest.TestCase):
         self.assertTrue(colored.endswith("\033[0m"))
         self.assertNotIn("\033[", plain)
         self.assertIn("INFO", plain)
+        record.event = "success"
+        self.assertIn("\033[32m", cleanup.ConsoleFormatter(color=True).format(record))
 
     def test_calendar_month_cutoff(self):
         self.assertEqual(cleanup.months_ago(datetime(2024, 11, 30, tzinfo=timezone.utc), 9),

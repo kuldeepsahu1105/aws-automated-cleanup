@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import logging
 import re
 import sys
 
@@ -12,6 +13,8 @@ from botocore.exceptions import BotoCoreError, ClientError
 from aws_cleanup import pick, prompt
 
 ORDER = ("iam-user", "instance-profile", "iam-role", "iam-policy", "s3-bucket", "hosted-zone")
+logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())
 
 
 def matches(name, prefix):
@@ -47,9 +50,22 @@ def scan(session, prefix):
             found.append(item("iam-policy", policy["Arn"], name=policy["PolicyName"],
                               attachments=policy.get("AttachmentCount", 0)))
     s3 = session.client("s3")
-    for bucket in s3.list_buckets().get("Buckets", []):
+    buckets = []
+    kwargs = {}
+    while True:
+        response = s3.list_buckets(**kwargs)
+        buckets.extend(response.get("Buckets", []))
+        token = response.get("ContinuationToken")
+        if not token:
+            break
+        if token == kwargs.get("ContinuationToken"):
+            raise ValueError("S3 returned a repeated bucket pagination token")
+        kwargs["ContinuationToken"] = token
+    for bucket in buckets:
         if matches(bucket["Name"], prefix):
             region = s3.get_bucket_location(Bucket=bucket["Name"]).get("LocationConstraint") or "us-east-1"
+            if region == "EU":
+                region = "eu-west-1"
             found.append(item("s3-bucket", bucket["Name"], region=region))
     route53 = session.client("route53")
     for zone in pages(route53, "list_hosted_zones", "HostedZones"):
@@ -63,6 +79,7 @@ def scan(session, prefix):
 def delete_user(iam, name):
     # Deactivate keys first so credentials stop working even if a later step fails.
     keys = list(pages(iam, "list_access_keys", "AccessKeyMetadata", UserName=name))
+    logger.info("IAM USER | %s | deactivating %d access key(s) before deletion", name, len(keys))
     for key in keys:
         iam.update_access_key(UserName=name, AccessKeyId=key["AccessKeyId"], Status="Inactive")
     for key in keys:
@@ -71,22 +88,33 @@ def delete_user(iam, name):
         iam.delete_login_profile(UserName=name)
     except iam.exceptions.NoSuchEntityException:
         pass
-    for cert in pages(iam, "list_signing_certificates", "Certificates", UserName=name):
+    for cert in list(pages(iam, "list_signing_certificates", "Certificates", UserName=name)):
         iam.delete_signing_certificate(UserName=name, CertificateId=cert["CertificateId"])
-    for key in pages(iam, "list_ssh_public_keys", "SSHPublicKeys", UserName=name):
+    for key in list(pages(iam, "list_ssh_public_keys", "SSHPublicKeys", UserName=name)):
         iam.delete_ssh_public_key(UserName=name, SSHPublicKeyId=key["SSHPublicKeyId"])
-    for cred in iam.list_service_specific_credentials(UserName=name).get("ServiceSpecificCredentials", []):
+    credentials = []
+    kwargs = {"UserName": name}
+    while True:
+        response = iam.list_service_specific_credentials(**kwargs)
+        credentials.extend(response.get("ServiceSpecificCredentials", []))
+        if not response.get("IsTruncated"):
+            break
+        marker = response.get("Marker")
+        if not marker or marker == kwargs.get("Marker"):
+            raise ValueError(f"Invalid IAM service credential pagination for {name}")
+        kwargs["Marker"] = marker
+    for cred in credentials:
         iam.delete_service_specific_credential(
             UserName=name, ServiceSpecificCredentialId=cred["ServiceSpecificCredentialId"])
-    for device in pages(iam, "list_mfa_devices", "MFADevices", UserName=name):
+    for device in list(pages(iam, "list_mfa_devices", "MFADevices", UserName=name)):
         iam.deactivate_mfa_device(UserName=name, SerialNumber=device["SerialNumber"])
         if ":mfa/" in device["SerialNumber"]:
             iam.delete_virtual_mfa_device(SerialNumber=device["SerialNumber"])
-    for policy in pages(iam, "list_attached_user_policies", "AttachedPolicies", UserName=name):
+    for policy in list(pages(iam, "list_attached_user_policies", "AttachedPolicies", UserName=name)):
         iam.detach_user_policy(UserName=name, PolicyArn=policy["PolicyArn"])
-    for policy in pages(iam, "list_user_policies", "PolicyNames", UserName=name):
+    for policy in list(pages(iam, "list_user_policies", "PolicyNames", UserName=name)):
         iam.delete_user_policy(UserName=name, PolicyName=policy)
-    for group in pages(iam, "list_groups_for_user", "Groups", UserName=name):
+    for group in list(pages(iam, "list_groups_for_user", "Groups", UserName=name)):
         iam.remove_user_from_group(UserName=name, GroupName=group["GroupName"])
     if iam.get_user(UserName=name)["User"].get("PermissionsBoundary"):
         iam.delete_user_permissions_boundary(UserName=name)
@@ -101,11 +129,11 @@ def delete_instance_profile(iam, name):
 
 
 def delete_role(iam, name):
-    for profile in pages(iam, "list_instance_profiles_for_role", "InstanceProfiles", RoleName=name):
+    for profile in list(pages(iam, "list_instance_profiles_for_role", "InstanceProfiles", RoleName=name)):
         iam.remove_role_from_instance_profile(InstanceProfileName=profile["InstanceProfileName"], RoleName=name)
-    for policy in pages(iam, "list_attached_role_policies", "AttachedPolicies", RoleName=name):
+    for policy in list(pages(iam, "list_attached_role_policies", "AttachedPolicies", RoleName=name)):
         iam.detach_role_policy(RoleName=name, PolicyArn=policy["PolicyArn"])
-    for policy in pages(iam, "list_role_policies", "PolicyNames", RoleName=name):
+    for policy in list(pages(iam, "list_role_policies", "PolicyNames", RoleName=name)):
         iam.delete_role_policy(RoleName=name, PolicyName=policy)
     if iam.get_role(RoleName=name)["Role"].get("PermissionsBoundary"):
         iam.delete_role_permissions_boundary(RoleName=name)
@@ -113,36 +141,40 @@ def delete_role(iam, name):
 
 
 def delete_policy(iam, arn):
-    for page in iam.get_paginator("list_entities_for_policy").paginate(PolicyArn=arn):
+    for page in list(iam.get_paginator("list_entities_for_policy").paginate(PolicyArn=arn)):
         for user in page.get("PolicyUsers", []):
             iam.detach_user_policy(UserName=user["UserName"], PolicyArn=arn)
         for group in page.get("PolicyGroups", []):
             iam.detach_group_policy(GroupName=group["GroupName"], PolicyArn=arn)
         for role in page.get("PolicyRoles", []):
             iam.detach_role_policy(RoleName=role["RoleName"], PolicyArn=arn)
-    for version in pages(iam, "list_policy_versions", "Versions", PolicyArn=arn):
+    for version in list(pages(iam, "list_policy_versions", "Versions", PolicyArn=arn)):
         if not version["IsDefaultVersion"]:
             iam.delete_policy_version(PolicyArn=arn, VersionId=version["VersionId"])
     iam.delete_policy(PolicyArn=arn)
 
 
-def delete_bucket(s3, name):
+def delete_bucket(s3, name, expected_owner=None):
+    logger.info("S3 | bucket=%s | removing object versions, delete markers, and incomplete uploads", name)
+    owner = {"ExpectedBucketOwner": expected_owner} if expected_owner else {}
     batch = []
-    for page in s3.get_paginator("list_object_versions").paginate(Bucket=name):
+    for page in s3.get_paginator("list_object_versions").paginate(Bucket=name, **owner):
         for obj in page.get("Versions", []) + page.get("DeleteMarkers", []):
             batch.append({"Key": obj["Key"], "VersionId": obj["VersionId"]})
             if len(batch) == 1000:
-                delete_objects(s3, name, batch)
+                delete_objects(s3, name, batch, expected_owner)
                 batch = []
     if batch:
-        delete_objects(s3, name, batch)
-    for upload in pages(s3, "list_multipart_uploads", "Uploads", Bucket=name):
-        s3.abort_multipart_upload(Bucket=name, Key=upload["Key"], UploadId=upload["UploadId"])
-    s3.delete_bucket(Bucket=name)
+        delete_objects(s3, name, batch, expected_owner)
+    for upload in pages(s3, "list_multipart_uploads", "Uploads", Bucket=name, **owner):
+        s3.abort_multipart_upload(Bucket=name, Key=upload["Key"], UploadId=upload["UploadId"], **owner)
+    s3.delete_bucket(Bucket=name, **owner)
 
 
-def delete_objects(s3, bucket, objects):
-    errors = s3.delete_objects(Bucket=bucket, Delete={"Objects": objects, "Quiet": True}).get("Errors")
+def delete_objects(s3, bucket, objects, expected_owner=None):
+    logger.info("S3 | bucket=%s | deleting batch of %d object version(s)", bucket, len(objects))
+    owner = {"ExpectedBucketOwner": expected_owner} if expected_owner else {}
+    errors = s3.delete_objects(Bucket=bucket, Delete={"Objects": objects, "Quiet": True}, **owner).get("Errors")
     if errors:
         raise ValueError(f"Could not delete {len(errors)} objects from {bucket}: {errors[0]}")
 
@@ -166,6 +198,8 @@ def delete_parent_delegation(route53, zone_id, zone_name):
 
 
 def delete_zone(route53, zone_id, zone_name):
+    logger.info("ROUTE53 | zone=%s id=%s | removing matching parent delegation and zone records",
+                zone_name, zone_id)
     delete_parent_delegation(route53, zone_id, zone_name)
     changes = [{"Action": "DELETE", "ResourceRecordSet": record}
                for record in pages(route53, "list_resource_record_sets", "ResourceRecordSets",
